@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<!--
+  mermaid-diagram/index.html — Sigma custom plugin (@sigmacomputing/plugin)
+  that renders a live-editable Mermaid diagram.
+
+  Editor-panel contract (do not rename — this is what plugin_embed.rb binds
+  and what any future gap-scan machinery keys off of):
+    mermaidText (type: text, multiline)  — the Mermaid markup itself. This is
+                the SOURCE OF TRUTH, persisted with the workbook via the
+                SDK's own config writeback (client.config.setKey) — no
+                external table needed. Editable either by typing directly
+                into the plugin's Edit pane, or via this field in Sigma's
+                own Properties panel.
+    defaultView (type: radio, values ['Preview','Edit']) — which pane is
+                shown. Lives ONLY in Sigma's Properties panel (there is no
+                in-canvas tab UI) and is read live/reactively, so switching
+                it never loses in-progress edits — those live in
+                `mermaidText`, a separate persisted field.
+
+  Editing model: typing in the Edit pane updates the render immediately
+  (debounced ~400ms) and, in the same debounce, persists to `mermaidText` via
+  client.config.setKey — so it survives a config change, a reload, or the
+  next time the workbook is opened. (An earlier version of this plugin bound
+  to an external Input Table column; that had no supported writeback path
+  and lost edits on any config change. This is the reason.)
+
+  Verified Sigma plugin-lifecycle gotchas encoded here:
+    - React loaded before the SDK (UMD build's hard peer dependency).
+    - Synthetic fallback: renders DEFAULT_DIAGRAM immediately, before ever
+      checking for a Sigma client, so it always previews standalone even
+      when the SDK is present but nothing ever calls back (see the gauge
+      plugin's README for the full rationale).
+    - ResizeObserver on the render container. Mermaid's SVG output already
+      carries a viewBox, so text doesn't blur/clip at odd widths the way a
+      hand-drawn canvas gauge would; the observer here is a defensive re-
+      application of the responsive width/height styling (Mermaid re-sets
+      inline attrs on every render), not a full geometry recompute.
+    - Background is transparent (not a hardcoded white), so the plugin
+      blends with whatever page/card background the workbook theme uses.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mermaid Diagram</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #mmd-root {
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: transparent;
+  }
+  #mmd-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    position: relative;
+    overflow: auto;
+  }
+  #mmd-edit-pane, #mmd-preview-pane {
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    display: none;
+  }
+  #mmd-edit-pane.is-visible, #mmd-preview-pane.is-visible {
+    display: block;
+  }
+  #mmd-edit-pane textarea {
+    margin: 0;
+    padding: 12px;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #1f2937;
+  }
+  #mmd-preview-pane {
+    padding: 12px;
+    box-sizing: border-box;
+    background: transparent;
+  }
+  #mmd-preview-pane svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  #mmd-zoom-controls {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 10;
+    display: none;
+    gap: 4px;
+  }
+  #mmd-zoom-controls.is-visible {
+    display: flex;
+  }
+  #mmd-zoom-controls button {
+    box-sizing: border-box;
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    padding: 0;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    background: #ffffff;
+    color: #374151;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #mmd-zoom-controls button:hover {
+    background: #f3f4f6;
+  }
+  .mmd-message {
+    padding: 16px;
+    color: #6b7280;
+    font-size: 13px;
+  }
+  .mmd-error {
+    padding: 16px;
+    color: #b91c1c;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<div id="mmd-root">
+  <div id="mmd-content">
+    <div id="mmd-edit-pane"><textarea id="mmd-edit-textarea" spellcheck="false" placeholder="Type or paste Mermaid markup here..."></textarea></div>
+    <div id="mmd-preview-pane"></div>
+    <div id="mmd-zoom-controls">
+      <button id="mmd-zoom-out" type="button" title="Zoom out">&#8722;</button>
+      <button id="mmd-zoom-reset" type="button" title="Reset zoom">&#8226;</button>
+      <button id="mmd-zoom-in" type="button" title="Zoom in">+</button>
+    </div>
+  </div>
+</div>
+
+<!--
+  REQUIRED: load React BEFORE the SDK. @sigmacomputing/plugin's UMD build has
+  React as a hard peer dependency and throws before assigning `client` if
+  React is absent — the plugin would then silently fall back to synth().
+  ReactDOM is NOT needed for the vanilla client API.
+-->
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<!-- Mermaid's UMD bundle exposes a global `mermaid`. Pinned to a long-stable release. -->
+<script src="https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var DEFAULT_DIAGRAM = [
+    'graph TD',
+    '  A[Start] --> B{Decision}',
+    '  B -->|Yes| C[Do the thing]',
+    '  B -->|No| D[Skip it]'
+  ].join('\n');
+
+  if (window.mermaid) {
+    window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
+  }
+
+  var editPane = document.getElementById('mmd-edit-pane');
+  var editTextarea = document.getElementById('mmd-edit-textarea');
+  var previewPane = document.getElementById('mmd-preview-pane');
+  var zoomControls = document.getElementById('mmd-zoom-controls');
+  var zoomInBtn = document.getElementById('mmd-zoom-in');
+  var zoomOutBtn = document.getElementById('mmd-zoom-out');
+  var zoomResetBtn = document.getElementById('mmd-zoom-reset');
+
+  var activeView = 'Preview'; // driven live by config.defaultView (Properties panel) — no in-canvas toggle
+  var currentSource = null;   // raw Mermaid text currently known/displayed
+  var renderCounter = 0;
+  var debounceTimer = null;
+
+  // In-canvas zoom, independent of Sigma's config/Properties panel — purely
+  // a local view affordance over the rendered SVG, not persisted, since it's
+  // a viewing convenience rather than part of the diagram's saved state.
+  var ZOOM_MIN = 0.25;
+  var ZOOM_MAX = 4;
+  var ZOOM_STEP = 1.2;
+  var zoomLevel = 1;
+
+  function setActiveView(view) {
+    var v = (view === 'Edit') ? 'Edit' : 'Preview';
+    activeView = v;
+    editPane.classList.toggle('is-visible', v === 'Edit');
+    previewPane.classList.toggle('is-visible', v === 'Preview');
+    zoomControls.classList.toggle('is-visible', v === 'Preview');
+    if (v === 'Preview') renderPreview(currentSource);
+  }
+
+  function setZoom(level) {
+    zoomLevel = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, level));
+    applyResponsiveSvgStyle(previewPane.querySelector('svg'));
+  }
+
+  zoomInBtn.addEventListener('click', function () { setZoom(zoomLevel * ZOOM_STEP); });
+  zoomOutBtn.addEventListener('click', function () { setZoom(zoomLevel / ZOOM_STEP); });
+  zoomResetBtn.addEventListener('click', function () { setZoom(1); });
+
+  function showMessage(container, text) {
+    container.innerHTML = '';
+    var msg = document.createElement('div');
+    msg.className = 'mmd-message';
+    msg.textContent = text;
+    container.appendChild(msg);
+  }
+
+  function showError(container, text) {
+    container.innerHTML = '';
+    var err = document.createElement('div');
+    err.className = 'mmd-error';
+    err.textContent = 'Mermaid parse error:\n' + text;
+    container.appendChild(err);
+  }
+
+  function applyResponsiveSvgStyle(svgEl) {
+    if (!svgEl) return;
+    svgEl.removeAttribute('height');
+    svgEl.style.width = '100%';
+    svgEl.style.height = 'auto';
+    svgEl.style.display = 'block';
+    // Zoom is a separate transform layered on top of the responsive base
+    // size (rather than baked into width%) — transform is unaffected by
+    // the SVG's intrinsic-aspect-ratio quirks and reliably scales visually,
+    // and #mmd-content's overflow:auto picks up the transformed bounding
+    // box so scrollbars appear once zoomed content exceeds the panel.
+    svgEl.style.transformOrigin = 'top left';
+    svgEl.style.transform = 'scale(' + zoomLevel + ')';
+  }
+
+  function renderPreview(source) {
+    // Always render into previewPane, regardless of which pane is currently
+    // visible — keeps Preview instantly up to date the moment the user (or
+    // a Properties-panel change) switches to it.
+    if (!source || !source.trim()) {
+      showMessage(previewPane, 'No Mermaid source yet.');
+      return;
+    }
+    if (!window.mermaid) {
+      showMessage(previewPane, 'Mermaid failed to load.');
+      return;
+    }
+    var id = 'mmd-render-' + (renderCounter++);
+    try {
+      var result = window.mermaid.render(id, source);
+      // mermaid v10's render() returns a Promise; guard for a sync-shaped
+      // return too in case of an older/patched bundle.
+      if (result && typeof result.then === 'function') {
+        result.then(function (r) {
+          previewPane.innerHTML = r.svg;
+          applyResponsiveSvgStyle(previewPane.querySelector('svg'));
+          if (r.bindFunctions) r.bindFunctions(previewPane);
+        }).catch(function (err) {
+          showError(previewPane, (err && err.message) ? err.message : String(err));
+        });
+      } else if (result && result.svg) {
+        previewPane.innerHTML = result.svg;
+        applyResponsiveSvgStyle(previewPane.querySelector('svg'));
+      }
+    } catch (err) {
+      showError(previewPane, (err && err.message) ? err.message : String(err));
+    }
+  }
+
+  // Applies text from an external source (config, or the initial standalone
+  // paint) to the textarea + preview. Guarded by the caller against
+  // clobbering an in-progress edit (see the `text !== currentSource` check
+  // in the config.subscribe handler below).
+  function setSource(source) {
+    currentSource = source || '';
+    editTextarea.value = currentSource;
+    renderPreview(currentSource);
+  }
+
+  var client =
+    (window.SigmaPlugin && window.SigmaPlugin.client) ||
+    (window.Sigma && window.Sigma.client) ||
+    null;
+
+  // The live-edit path: every keystroke updates local state + re-renders
+  // Preview on a debounce, and — when embedded in Sigma — persists to the
+  // `mermaidText` config field in the same debounce via setKey, so the edit
+  // survives a config change, a reload, or reopening the workbook later.
+  editTextarea.addEventListener('input', function () {
+    currentSource = editTextarea.value;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function () {
+      renderPreview(currentSource);
+      if (client) client.config.setKey('mermaidText', currentSource);
+    }, 400);
+  });
+
+  // ResizeObserver: defensive re-application of responsive SVG sizing.
+  // Mermaid sets its own width/height attrs on every render, so this keeps
+  // the diagram filling the panel as it's resized rather than relying on a
+  // one-time style application. Full geometry recompute (as the gauge
+  // plugin does) isn't needed here — Mermaid's SVG carries its own viewBox,
+  // so vector text scales cleanly without going illegible.
+  new ResizeObserver(function () {
+    applyResponsiveSvgStyle(previewPane.querySelector('svg'));
+  }).observe(document.getElementById('mmd-root'));
+
+  // Immediate standalone paint: covers both "no client at all" (opened as a
+  // bare file, React/SDK missing) AND "client object exists but there's no
+  // real Sigma host to ever invoke config.subscribe" (SDK loaded standalone
+  // in a plain browser tab) — the latter would otherwise hang blank forever
+  // waiting for a callback that never arrives. Real config overwrites this
+  // once (and if) it does arrive.
+  setActiveView('Preview');
+  setSource(DEFAULT_DIAGRAM);
+
+  if (!client) return;
+
+  client.config.configureEditorPanel([
+    {
+      name: 'mermaidText', type: 'text', label: 'Mermaid Source',
+      multiline: true, defaultValue: DEFAULT_DIAGRAM
+    },
+    {
+      name: 'defaultView', type: 'radio', label: 'Default View',
+      values: ['Preview', 'Edit'], defaultValue: 'Preview', singleLine: true
+    }
+  ]);
+
+  client.config.subscribe(function (config) {
+    setActiveView((config && config.defaultView) || 'Preview');
+
+    var text = (config && typeof config.mermaidText === 'string') ? config.mermaidText : null;
+    // Skip re-applying if it matches what we already have — this is either
+    // our own write echoing back (avoids clobbering textarea cursor/focus)
+    // or simply unchanged.
+    if (text !== null && text !== currentSource) {
+      setSource(text);
+    }
+  });
+})();
+</script>
+</body>
+</html>
