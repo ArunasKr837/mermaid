@@ -1,360 +1,1458 @@
 <!DOCTYPE html>
 <!--
   mermaid-diagram/index.html — Sigma custom plugin (@sigmacomputing/plugin)
-  that renders a live-editable Mermaid diagram.
+  that renders a live-editable, navigable Mermaid diagram.
 
   Editor-panel contract (do not rename — this is what plugin_embed.rb binds
   and what any future gap-scan machinery keys off of):
-    mermaidText (type: text, multiline)  — the Mermaid markup itself. This is
-                the SOURCE OF TRUTH, persisted with the workbook via the
-                SDK's own config writeback (client.config.setKey) — no
-                external table needed. Editable either by typing directly
-                into the plugin's Edit pane, or via this field in Sigma's
-                own Properties panel.
-    defaultView (type: radio, values ['Preview','Edit']) — which pane is
-                shown. Lives ONLY in Sigma's Properties panel (there is no
-                in-canvas tab UI) and is read live/reactively, so switching
-                it never loses in-progress edits — those live in
-                `mermaidText`, a separate persisted field.
+    mermaidText   (text, multiline) — the Mermaid markup. SOURCE OF TRUTH,
+                  persisted via client.config.setKey. Also carries optional
+                  '%% @details <nodeId> | Key: Value | ...' comment lines
+                  that feed the node details panel.
+    defaultView   (radio Preview|Edit) — which pane is shown.
+    layout        (dropdown) — Dagre or one of the ELK algorithms bundled
+                  with Mermaid 12.
+    startCollapsed(toggle) — flowchart subgraphs start collapsed.
+    showToolbar   (toggle) — search + collapse/expand-all toolbar.
+  Editing happens only through the Properties panel: set "Default View" to
+  Edit to get a plain textarea over the source, back to Preview for the
+  diagram. Layout is Properties-panel only (no in-canvas selects). A
+  %%{init}%% directive or frontmatter config in the source styles the diagram
+  (theme, colours, look) and takes precedence over the layout setting.
 
-  Editing model: typing in the Edit pane updates the render immediately
-  (debounced ~400ms) and, in the same debounce, persists to `mermaidText` via
-  client.config.setKey — so it survives a config change, a reload, or the
-  next time the workbook is opened. (An earlier version of this plugin bound
-  to an external Input Table column; that had no supported writeback path
-  and lost edits on any config change. This is the reason.)
+  Versioning was removed. Sources saved by older builds hold several
+  "%% @section <id> | ..." blocks; on load only the LATEST block is used, and
+  the first edit rewrites mermaidText as plain Mermaid.
+
+  View-only state (NOT persisted): pan/zoom, collapsed groups, search,
+  selected node.
 
   Verified Sigma plugin-lifecycle gotchas encoded here:
     - React loaded before the SDK (UMD build's hard peer dependency).
     - Synthetic fallback: renders DEFAULT_DIAGRAM immediately, before ever
-      checking for a Sigma client, so it always previews standalone even
-      when the SDK is present but nothing ever calls back (see the gauge
-      plugin's README for the full rationale).
-    - ResizeObserver on the render container. Mermaid's SVG output already
-      carries a viewBox, so text doesn't blur/clip at odd widths the way a
-      hand-drawn canvas gauge would; the observer here is a defensive re-
-      application of the responsive width/height styling (Mermaid re-sets
-      inline attrs on every render), not a full geometry recompute.
-    - Background is transparent (not a hardcoded white), so the plugin
-      blends with whatever page/card background the workbook theme uses.
+      checking for a Sigma client.
+    - Config-echo guard: our own setKey writes echo back through subscribe
+      (possibly with CRLF / trimmed whitespace); texts are compared after
+      normalisation and unchanged values are ignored so the textarea / view
+      aren't clobbered.
+    - Background is transparent for light themes.
 -->
 <html>
 <head>
 <meta charset="utf-8">
 <title>Mermaid Diagram</title>
 <style>
+  :root {
+    --mmd-fg: #1f2937;
+    --mmd-muted: #6b7280;
+    --mmd-border: #e3e6eb;
+    --mmd-border-strong: #cdd2d9;
+    --mmd-ctrl-bg: #ffffff;
+    --mmd-ctrl-hover: #f6f7f9;
+    --mmd-panel-bg: #ffffff;
+    --mmd-canvas: transparent;
+    --mmd-accent: #2563eb;
+    --mmd-accent-hover: #1d4fd8;
+    --mmd-ring: rgba(37,99,235,.18);
+    --mmd-hit: #f59e0b;
+    --mmd-shadow: 0 4px 16px rgba(16,24,40,.10), 0 1px 3px rgba(16,24,40,.06);
+  }
+  #mmd-root.is-dark {
+    --mmd-fg: #e5e7eb;
+    --mmd-muted: #9ca3af;
+    --mmd-border: #3a3a41;
+    --mmd-border-strong: #52525b;
+    --mmd-ctrl-bg: #27272a;
+    --mmd-ctrl-hover: #323238;
+    --mmd-panel-bg: #202024;
+    --mmd-canvas: #18181b;
+    --mmd-accent: #60a5fa;
+    --mmd-accent-hover: #7bb6fb;
+    --mmd-ring: rgba(96,165,250,.25);
+    --mmd-shadow: 0 4px 16px rgba(0,0,0,.45);
+  }
   html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background: transparent;
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: transparent;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   #mmd-root {
-    box-sizing: border-box;
-    width: 100%;
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-    background: transparent;
+    box-sizing: border-box; width: 100%; height: 100%;
+    display: flex; flex-direction: column;
+    background: var(--mmd-canvas); color: var(--mmd-fg);
   }
-  #mmd-content {
-    flex: 1 1 auto;
-    min-height: 0;
-    position: relative;
-    overflow: auto;
-  }
-  #mmd-edit-pane, #mmd-preview-pane {
-    box-sizing: border-box;
-    width: 100%;
-    height: 100%;
-    display: none;
-  }
-  #mmd-edit-pane.is-visible, #mmd-preview-pane.is-visible {
-    display: block;
-  }
+  #mmd-content { flex: 1 1 auto; min-height: 0; position: relative; overflow: hidden; }
+
+  #mmd-edit-pane, #mmd-preview-pane { position: absolute; inset: 0; display: none; }
+  #mmd-edit-pane.is-visible, #mmd-preview-pane.is-visible { display: block; }
   #mmd-edit-pane textarea {
-    margin: 0;
-    padding: 12px;
-    width: 100%;
-    height: 100%;
-    box-sizing: border-box;
-    border: none;
-    outline: none;
-    resize: none;
-    background: transparent;
-    white-space: pre-wrap;
-    word-break: break-word;
+    margin: 0; padding: 12px; width: 100%; height: 100%; box-sizing: border-box;
+    border: none; outline: none; resize: none; background: transparent;
+    white-space: pre-wrap; word-break: break-word;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.5;
-    color: #1f2937;
+    font-size: 12px; line-height: 1.5; color: var(--mmd-fg);
   }
-  #mmd-preview-pane {
-    padding: 12px;
-    box-sizing: border-box;
-    background: transparent;
-  }
-  #mmd-preview-pane svg {
-    display: block;
-    width: 100%;
-    height: auto;
-  }
-  #mmd-zoom-controls {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    z-index: 10;
-    display: none;
-    gap: 4px;
-  }
-  #mmd-zoom-controls.is-visible {
-    display: flex;
-  }
-  #mmd-zoom-controls button {
-    box-sizing: border-box;
-    width: 24px;
-    height: 24px;
-    line-height: 1;
-    padding: 0;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    background: #ffffff;
-    color: #374151;
-    font-size: 14px;
-    cursor: pointer;
-  }
-  #mmd-zoom-controls button:hover {
-    background: #f3f4f6;
-  }
-  .mmd-message {
-    padding: 16px;
-    color: #6b7280;
-    font-size: 13px;
-  }
+
+  /* ---- Pan/zoom viewport ---- */
+  #mmd-preview-pane { overflow: hidden; touch-action: none; cursor: grab; outline: none; }
+  #mmd-preview-pane.is-panning { cursor: grabbing; }
+  #mmd-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+  #mmd-stage.is-animating { transition: transform 220ms ease-out; }
+  #mmd-stage svg { display: block; max-width: none !important; }
+  #mmd-message { position: absolute; inset: 0; overflow: auto; display: none; cursor: default; }
+  #mmd-message.is-visible { display: block; }
+  .mmd-message { padding: 16px; color: var(--mmd-muted); font-size: 13px; }
   .mmd-error {
-    padding: 16px;
-    color: #b91c1c;
+    padding: 16px; color: #b91c1c; font-size: 12px; white-space: pre-wrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    white-space: pre-wrap;
   }
+  #mmd-root.is-dark .mmd-error { color: #fca5a5; }
+
+  /* ---- Interactive diagram affordances ---- */
+  #mmd-stage .mmd-node { cursor: pointer; }
+  #mmd-stage .mmd-cluster-toggle { cursor: pointer; }
+  #mmd-stage .mmd-selected > rect, #mmd-stage .mmd-selected > polygon,
+  #mmd-stage .mmd-selected > circle, #mmd-stage .mmd-selected > path,
+  #mmd-stage .mmd-selected > g > rect, #mmd-stage .mmd-selected > g > path {
+    stroke: var(--mmd-accent) !important; stroke-width: 3px !important;
+  }
+  #mmd-stage svg.mmd-searching .mmd-node:not(.mmd-hit) { opacity: .3; }
+  #mmd-stage svg.mmd-searching .edgePaths, #mmd-stage svg.mmd-searching .edgeLabels,
+  #mmd-stage svg.mmd-searching [data-et="edge"] { opacity: .35; }
+  #mmd-stage .mmd-hit > rect, #mmd-stage .mmd-hit > polygon, #mmd-stage .mmd-hit > circle,
+  #mmd-stage .mmd-hit > path, #mmd-stage .mmd-hit > g > rect, #mmd-stage .mmd-hit > g > path {
+    stroke: var(--mmd-hit) !important; stroke-width: 3px !important;
+  }
+  #mmd-stage .mmd-hit-current { filter: drop-shadow(0 0 6px var(--mmd-hit)); }
+  #mmd-stage .mmd-hit-current > rect, #mmd-stage .mmd-hit-current > polygon,
+  #mmd-stage .mmd-hit-current > circle, #mmd-stage .mmd-hit-current > path,
+  #mmd-stage .mmd-hit-current > g > rect, #mmd-stage .mmd-hit-current > g > path {
+    stroke-width: 5px !important;
+  }
+
+  /* ---- Controls (shared) ---- */
+  .mmd-ctrl {
+    box-sizing: border-box; height: 30px; min-width: 30px; padding: 0 12px;
+    border: 1px solid var(--mmd-border); border-radius: 8px;
+    background: var(--mmd-ctrl-bg); color: var(--mmd-fg);
+    font-family: inherit; font-size: 12px; font-weight: 500; line-height: 1; letter-spacing: .01em;
+    cursor: pointer; box-shadow: 0 1px 2px rgba(16,24,40,.05);
+    transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease, color .15s ease;
+  }
+  button.mmd-ctrl { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; }
+  button.mmd-ctrl:hover:not(:disabled) { background: var(--mmd-ctrl-hover); border-color: var(--mmd-border-strong); }
+  button.mmd-ctrl:active:not(:disabled) { transform: translateY(0.5px); box-shadow: none; }
+  .mmd-ctrl:focus-visible {
+    outline: none; border-color: var(--mmd-accent); box-shadow: 0 0 0 3px var(--mmd-ring);
+  }
+  select.mmd-ctrl { padding: 0 8px; max-width: 130px; }
+  input.mmd-ctrl { cursor: text; width: 170px; padding: 0 10px; font-weight: 400; }
+  input.mmd-ctrl::placeholder { color: var(--mmd-muted); }
+  .mmd-overlay { position: absolute; z-index: 10; display: none; }
+  .mmd-overlay.is-visible { display: flex; }
+
+  #mmd-toolbar {
+    top: 8px; left: 8px; right: 8px; gap: 6px; flex-wrap: wrap;
+    align-items: center; pointer-events: none;
+  }
+  #mmd-toolbar > * { pointer-events: auto; }
+  #mmd-toolbar .mmd-spacer { flex: 1 1 auto; pointer-events: none; }
+  #mmd-search-wrap { display: flex; gap: 4px; align-items: center; }
+  #mmd-search-count { font-size: 11px; color: var(--mmd-muted); min-width: 34px; }
+  #mmd-search-nav { display: none; gap: 2px; }
+  #mmd-search-nav.is-visible { display: flex; }
+  #mmd-group-ctrls { display: none; gap: 4px; }
+  #mmd-group-ctrls.is-visible { display: flex; }
+
+  /* Zoom controls: one segmented pill instead of four loose buttons */
+  #mmd-zoom-controls {
+    bottom: 10px; right: 10px; gap: 0; overflow: hidden;
+    background: var(--mmd-ctrl-bg); border: 1px solid var(--mmd-border);
+    border-radius: 10px; box-shadow: var(--mmd-shadow);
+  }
+  #mmd-zoom-controls .mmd-ctrl { border: none; border-radius: 0; box-shadow: none; background: transparent; }
+  #mmd-zoom-controls .mmd-ctrl + .mmd-ctrl { border-left: 1px solid var(--mmd-border); }
+  #mmd-zoom-pct { min-width: 56px; font-variant-numeric: tabular-nums; }
+
+  /* ---- Buttons ---- */
+  .mmd-ctrl.mmd-primary { background: var(--mmd-accent); border-color: var(--mmd-accent); color: #fff; }
+  button.mmd-ctrl.mmd-primary:hover:not(:disabled) { background: var(--mmd-accent-hover); border-color: var(--mmd-accent-hover); }
+  #mmd-root.is-dark .mmd-ctrl.mmd-primary { color: #0b1220; }
+  .mmd-ctrl:disabled { opacity: .4; cursor: default; box-shadow: none; }
+
+  /* ---- Edit view ---- */
+  #mmd-edit-pane.is-visible { display: flex; flex-direction: column; }
+  #mmd-edit-pane textarea { flex: 1 1 auto; height: auto; min-height: 0; }
+  #mmd-edit-header {
+    flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px;
+    padding: 8px 10px; font-size: 12px; color: var(--mmd-fg);
+    background: var(--mmd-panel-bg); border-bottom: 1px solid var(--mmd-border);
+    border-left: 4px solid var(--mmd-accent);
+  }
+  .mmd-eh-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .mmd-eh-row .mmd-spacer { flex: 1 1 auto; }
+  .mmd-eh-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: .06em; padding: 3px 6px; border-radius: 3px;
+    background: var(--mmd-accent); color: #fff;
+  }
+  #mmd-eh-syntax, #mmd-eh-save { color: var(--mmd-muted); font-size: 11px; }
+  #mmd-eh-syntax.is-error, #mmd-eh-save.is-error { color: #dc2626; }
+  #mmd-warn {
+    position: absolute; z-index: 40; top: 8px; left: 50%; transform: translateX(-50%); display: none;
+    max-width: min(560px, calc(100% - 24px)); padding: 8px 14px; border-radius: 10px; cursor: pointer;
+    font-size: 12px; line-height: 1.4; background: #fef3c7; color: #78350f; border: 1px solid #fcd34d; box-shadow: var(--mmd-shadow);
+  }
+  #mmd-warn.is-visible { display: block; }
+
+  /* ---- Node details panel ---- */
+  #mmd-details {
+    position: absolute; z-index: 20; top: 42px; right: 8px; bottom: 42px;
+    width: min(300px, calc(100% - 16px)); box-sizing: border-box;
+    display: none; flex-direction: column; overflow: hidden;
+    background: var(--mmd-panel-bg); color: var(--mmd-fg);
+    border: 1px solid var(--mmd-border); border-radius: 10px; box-shadow: var(--mmd-shadow);
+    font-size: 12px;
+  }
+  #mmd-details.is-visible { display: flex; }
+  #mmd-details header {
+    display: flex; align-items: flex-start; gap: 8px; padding: 10px 10px 8px 12px;
+    border-bottom: 1px solid var(--mmd-border);
+  }
+  #mmd-details header .mmd-d-head { flex: 1 1 auto; min-width: 0; }
+  #mmd-d-title { font-size: 14px; font-weight: 600; word-break: break-word; }
+  #mmd-d-id { margin-top: 2px; color: var(--mmd-muted); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  #mmd-d-close { border: none; background: transparent; color: var(--mmd-muted); font-size: 16px; cursor: pointer; padding: 0 2px; }
+  #mmd-d-body { padding: 8px 12px 12px; overflow: auto; }
+  .mmd-d-desc { margin: 4px 0 8px; line-height: 1.45; white-space: pre-wrap; }
+  .mmd-d-status {
+    display: inline-block; margin: 2px 0 6px; padding: 2px 8px; border-radius: 10px;
+    background: var(--mmd-ctrl-hover); border: 1px solid var(--mmd-border); font-size: 11px;
+  }
+  .mmd-d-row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; padding: 4px 0; border-top: 1px dashed var(--mmd-border); }
+  .mmd-d-key { color: var(--mmd-muted); }
+  .mmd-d-val { word-break: break-word; white-space: pre-wrap; }
+  .mmd-d-val code { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  .mmd-d-section { margin-top: 10px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--mmd-muted); }
+  .mmd-d-links { margin: 4px 0 0; padding: 0; list-style: none; }
+  .mmd-d-links li { padding: 2px 0; }
+  #mmd-details a, .mmd-linkbtn { color: var(--mmd-accent); }
+  .mmd-linkbtn { border: none; background: none; padding: 0; font: inherit; cursor: pointer; text-align: left; text-decoration: underline; }
+  .mmd-d-hint { margin-top: 10px; color: var(--mmd-muted); font-size: 11px; line-height: 1.4; }
 </style>
 </head>
 <body>
 <div id="mmd-root">
   <div id="mmd-content">
-    <div id="mmd-edit-pane"><textarea id="mmd-edit-textarea" spellcheck="false" placeholder="Type or paste Mermaid markup here..."></textarea></div>
-    <div id="mmd-preview-pane"></div>
-    <div id="mmd-zoom-controls">
-      <button id="mmd-zoom-out" type="button" title="Zoom out">&#8722;</button>
-      <button id="mmd-zoom-reset" type="button" title="Reset zoom">&#8226;</button>
-      <button id="mmd-zoom-in" type="button" title="Zoom in">+</button>
+    <div id="mmd-edit-pane">
+      <div id="mmd-edit-header">
+        <div class="mmd-eh-row">
+          <span class="mmd-eh-badge">EDITING</span>
+        </div>
+        <div class="mmd-eh-row">
+          <span id="mmd-eh-syntax"></span>
+          <span class="mmd-spacer"></span>
+          <span id="mmd-eh-save"></span>
+        </div>
+      </div>
+      <textarea id="mmd-edit-textarea" spellcheck="false" placeholder="Type or paste Mermaid markup here..."></textarea>
     </div>
+
+    <div id="mmd-preview-pane" tabindex="0" aria-label="Diagram canvas. Drag to pan, scroll or pinch to zoom.">
+      <div id="mmd-stage"></div>
+      <div id="mmd-message"></div>
+    </div>
+
+    <div id="mmd-toolbar" class="mmd-overlay">
+      <div id="mmd-search-wrap">
+        <input id="mmd-search" class="mmd-ctrl" type="search" placeholder="Search nodes…  ( / )" autocomplete="off" spellcheck="false">
+        <div id="mmd-search-nav">
+          <button id="mmd-search-prev" class="mmd-ctrl" type="button" title="Previous match (Shift+Enter)">&#8593;</button>
+          <button id="mmd-search-next" class="mmd-ctrl" type="button" title="Next match (Enter)">&#8595;</button>
+        </div>
+        <span id="mmd-search-count"></span>
+      </div>
+      <div class="mmd-spacer"></div>
+      <div id="mmd-group-ctrls">
+        <button id="mmd-collapse-all" class="mmd-ctrl" type="button" title="Collapse all groups">Collapse all</button>
+        <button id="mmd-expand-all" class="mmd-ctrl" type="button" title="Expand all groups">Expand all</button>
+      </div>
+    </div>
+
+    <div id="mmd-warn" role="alert"></div>
+
+    <div id="mmd-zoom-controls" class="mmd-overlay">
+      <button id="mmd-zoom-out" class="mmd-ctrl" type="button" title="Zoom out (−)">&#8722;</button>
+      <button id="mmd-zoom-pct" class="mmd-ctrl" type="button" title="Reset to 100% (0)">100%</button>
+      <button id="mmd-zoom-in" class="mmd-ctrl" type="button" title="Zoom in (+)">+</button>
+      <button id="mmd-zoom-fit" class="mmd-ctrl" type="button" title="Fit to screen (F)">&#10530;</button>
+    </div>
+
+    <aside id="mmd-details" aria-live="polite">
+      <header>
+        <div class="mmd-d-head"><div id="mmd-d-title"></div><div id="mmd-d-id"></div></div>
+        <button id="mmd-d-close" type="button" title="Close (Esc)">&#10005;</button>
+      </header>
+      <div id="mmd-d-body"></div>
+    </aside>
   </div>
 </div>
 
 <!--
   REQUIRED: load React BEFORE the SDK. @sigmacomputing/plugin's UMD build has
-  React as a hard peer dependency and throws before assigning `client` if
+  React as a hard peer dependency and throws before assigning 'client' if
   React is absent — the plugin would then silently fall back to synth().
-  ReactDOM is NOT needed for the vanilla client API.
 -->
+
+
 <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/@sigmacomputing/plugin"></script>
-<!-- Mermaid's UMD bundle exposes a global `mermaid`. Pinned to a long-stable release. -->
-<script src="https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<!-- Mermaid 12 UMD bundle (global 'mermaid'). Bundles ELK layouts. Pinned. -->
+<script src="https://unpkg.com/mermaid@12.0.0/dist/mermaid.min.js"></script>
 <script>
 (function () {
   'use strict';
 
+  // ------------------------------------------------------------------
+  // Constants
+  // ------------------------------------------------------------------
   var DEFAULT_DIAGRAM = [
-    'graph TD',
+    'flowchart TD',
     '  A[Start] --> B{Decision}',
     '  B -->|Yes| C[Do the thing]',
-    '  B -->|No| D[Skip it]'
+    '  B -->|No| D[Skip it]',
+    '  C --> E([Done])',
+    '  D --> E',
+    '',
+    '  %% Node details — shown when a node is clicked:',
+    '  %% @details B | Description: Replace this sample with your own diagram. | Owner: You | Status: Sample'
   ].join('\n');
 
-  if (window.mermaid) {
-    window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
+  // [mermaid value, friendly label]. Properties dropdowns store the label.
+  var LAYOUTS = [
+    ['dagre', 'Dagre'], ['elk', 'ELK Layered'], ['elk.mrtree', 'ELK Tree'],
+    ['elk.stress', 'ELK Stress'], ['elk.force', 'ELK Force'], ['elk.box', 'ELK Box'],
+    ['elk.rectpacking', 'ELK Rect Packing'], ['elk.sporeOverlap', 'ELK Spore Overlap']
+  ];
+
+  var ZOOM_MIN = 0.1, ZOOM_MAX = 8, ZOOM_STEP = 1.25, FIT_MAX = 1.5;
+  var HAS_OWN = Object.prototype.hasOwnProperty;
+
+  function toValue(list, v, fallback) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i][0] === v || list[i][1] === v) return list[i][0];
+    }
+    return fallback;
   }
+  function toLabel(list, v) {
+    for (var i = 0; i < list.length; i++) if (list[i][0] === v) return list[i][1];
+    return v;
+  }
+  function labelsOf(list) { return list.map(function (p) { return p[1]; }); }
 
-  var editPane = document.getElementById('mmd-edit-pane');
-  var editTextarea = document.getElementById('mmd-edit-textarea');
-  var previewPane = document.getElementById('mmd-preview-pane');
-  var zoomControls = document.getElementById('mmd-zoom-controls');
-  var zoomInBtn = document.getElementById('mmd-zoom-in');
-  var zoomOutBtn = document.getElementById('mmd-zoom-out');
-  var zoomResetBtn = document.getElementById('mmd-zoom-reset');
+  // ------------------------------------------------------------------
+  // DOM
+  // ------------------------------------------------------------------
+  function $(id) { return document.getElementById(id); }
+  var root = $('mmd-root');
+  var editPane = $('mmd-edit-pane');
+  var editTextarea = $('mmd-edit-textarea');
+  var viewport = $('mmd-preview-pane');
+  var stage = $('mmd-stage');
+  var messageEl = $('mmd-message');
+  var toolbar = $('mmd-toolbar');
+  var zoomControls = $('mmd-zoom-controls');
+  var zoomPct = $('mmd-zoom-pct');
+  var searchInput = $('mmd-search');
+  var searchNav = $('mmd-search-nav');
+  var searchCount = $('mmd-search-count');
+  var groupCtrls = $('mmd-group-ctrls');
+  var detailsEl = $('mmd-details');
+  var dTitle = $('mmd-d-title');
+  var dId = $('mmd-d-id');
+  var dBody = $('mmd-d-body');
 
-  var activeView = 'Preview'; // driven live by config.defaultView (Properties panel) — no in-canvas toggle
-  var currentSource = null;   // raw Mermaid text currently known/displayed
-  var renderCounter = 0;
+  // ------------------------------------------------------------------
+  // State
+  // ------------------------------------------------------------------
+  var state = {
+    view: 'Preview',
+    source: null,
+    layout: 'elk',
+    showToolbar: true,
+    startCollapsed: false,
+    configView: 'Preview'
+  };
+  var model = emptyModel();
+  var collapsed = {};            // groupId -> true (view-only)
+  var collapseInitDone = false;  // startCollapsed applied once per load/toggle
+  var nodeEls = {};              // rendered node id -> <g>
+  var clusterEls = {};           // rendered cluster id -> <g>
+  var placeholderIds = {};       // collapsed-group placeholder node ids currently rendered
+  var hiddenMap = {};            // original id -> collapsed group id that hides it
+  var selectedId = null;
+  var search = { query: '', matches: [], idx: -1 };
+
+  var view = { k: 1, tx: 0, ty: 0, w: 0, h: 0, userMoved: false, needsFit: true };
+  var renderSeq = 0, renderCounter = 0;
   var debounceTimer = null;
-
-  // In-canvas zoom, independent of Sigma's config/Properties panel — purely
-  // a local view affordance over the rendered SVG, not persisted, since it's
-  // a viewing convenience rather than part of the diagram's saved state.
-  var ZOOM_MIN = 0.25;
-  var ZOOM_MAX = 4;
-  var ZOOM_STEP = 1.2;
-  var zoomLevel = 1;
-
-  function setActiveView(view) {
-    var v = (view === 'Edit') ? 'Edit' : 'Preview';
-    activeView = v;
-    editPane.classList.toggle('is-visible', v === 'Edit');
-    previewPane.classList.toggle('is-visible', v === 'Preview');
-    zoomControls.classList.toggle('is-visible', v === 'Preview');
-    if (v === 'Preview') renderPreview(currentSource);
-  }
-
-  function setZoom(level) {
-    zoomLevel = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, level));
-    applyResponsiveSvgStyle(previewPane.querySelector('svg'));
-  }
-
-  zoomInBtn.addEventListener('click', function () { setZoom(zoomLevel * ZOOM_STEP); });
-  zoomOutBtn.addEventListener('click', function () { setZoom(zoomLevel / ZOOM_STEP); });
-  zoomResetBtn.addEventListener('click', function () { setZoom(1); });
-
-  function showMessage(container, text) {
-    container.innerHTML = '';
-    var msg = document.createElement('div');
-    msg.className = 'mmd-message';
-    msg.textContent = text;
-    container.appendChild(msg);
-  }
-
-  function showError(container, text) {
-    container.innerHTML = '';
-    var err = document.createElement('div');
-    err.className = 'mmd-error';
-    err.textContent = 'Mermaid parse error:\n' + text;
-    container.appendChild(err);
-  }
-
-  function applyResponsiveSvgStyle(svgEl) {
-    if (!svgEl) return;
-    svgEl.removeAttribute('height');
-    svgEl.style.width = '100%';
-    svgEl.style.height = 'auto';
-    svgEl.style.display = 'block';
-    // Zoom is a separate transform layered on top of the responsive base
-    // size (rather than baked into width%) — transform is unaffected by
-    // the SVG's intrinsic-aspect-ratio quirks and reliably scales visually,
-    // and #mmd-content's overflow:auto picks up the transformed bounding
-    // box so scrollbars appear once zoomed content exceeds the panel.
-    svgEl.style.transformOrigin = 'top left';
-    svgEl.style.transform = 'scale(' + zoomLevel + ')';
-  }
-
-  function renderPreview(source) {
-    // Always render into previewPane, regardless of which pane is currently
-    // visible — keeps Preview instantly up to date the moment the user (or
-    // a Properties-panel change) switches to it.
-    if (!source || !source.trim()) {
-      showMessage(previewPane, 'No Mermaid source yet.');
-      return;
-    }
-    if (!window.mermaid) {
-      showMessage(previewPane, 'Mermaid failed to load.');
-      return;
-    }
-    var id = 'mmd-render-' + (renderCounter++);
-    try {
-      var result = window.mermaid.render(id, source);
-      // mermaid v10's render() returns a Promise; guard for a sync-shaped
-      // return too in case of an older/patched bundle.
-      if (result && typeof result.then === 'function') {
-        result.then(function (r) {
-          previewPane.innerHTML = r.svg;
-          applyResponsiveSvgStyle(previewPane.querySelector('svg'));
-          if (r.bindFunctions) r.bindFunctions(previewPane);
-        }).catch(function (err) {
-          showError(previewPane, (err && err.message) ? err.message : String(err));
-        });
-      } else if (result && result.svg) {
-        previewPane.innerHTML = result.svg;
-        applyResponsiveSvgStyle(previewPane.querySelector('svg'));
-      }
-    } catch (err) {
-      showError(previewPane, (err && err.message) ? err.message : String(err));
-    }
-  }
-
-  // Applies text from an external source (config, or the initial standalone
-  // paint) to the textarea + preview. Guarded by the caller against
-  // clobbering an in-progress edit (see the `text !== currentSource` check
-  // in the config.subscribe handler below).
-  function setSource(source) {
-    currentSource = source || '';
-    editTextarea.value = currentSource;
-    renderPreview(currentSource);
-  }
 
   var client =
     (window.SigmaPlugin && window.SigmaPlugin.client) ||
     (window.Sigma && window.Sigma.client) ||
     null;
 
-  // The live-edit path: every keystroke updates local state + re-renders
-  // Preview on a debounce, and — when embedded in Sigma — persists to the
-  // `mermaidText` config field in the same debounce via setKey, so the edit
-  // survives a config change, a reload, or reopening the workbook later.
-  editTextarea.addEventListener('input', function () {
-    currentSource = editTextarea.value;
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(function () {
-      renderPreview(currentSource);
-      if (client) client.config.setKey('mermaidText', currentSource);
-    }, 400);
+  function persist(key, value) {
+    if (!client) return;
+    try { client.config.setKey(key, value); } catch (e) { /* view-only session */ }
+  }
+
+  // ------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------
+  function stripHtml(s) {
+    if (s == null) return '';
+    var d = document.createElement('div');
+    d.innerHTML = String(s).replace(/<br\s*\/?>/gi, ' ');
+    return (d.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function emptyModel() {
+    return { isFlowchart: false, vertices: {}, vertexOrder: [], edges: [], groups: {}, groupOrder: [], parent: {}, details: {} };
+  }
+  function safeUrl(u) {
+    return /^(https?:|mailto:)/i.test(String(u).trim()) ? String(u).trim() : null;
+  }
+
+  // '%% @details <id> | Key: Value | Key: Value' (multiple lines merge).
+  function parseDetails(src) {
+    var out = {};
+    String(src || '').split('\n').forEach(function (line) {
+      var m = /^\s*%%\s*@details\s+([^\s|]+)\s*(.*)$/.exec(line);
+      if (!m) return;
+      var id = m[1];
+      var list = out[id] || (out[id] = []);
+      m[2].split('|').forEach(function (part) {
+        part = part.trim();
+        if (!part) return;
+        var c = part.indexOf(':');
+        if (c > 0 && !/^\w+:\/\//.test(part)) {
+          list.push({ key: part.slice(0, c).trim(), value: part.slice(c + 1).trim() });
+        } else {
+          list.push({ key: 'Description', value: part });
+        }
+      });
+    });
+    return out;
+  }
+
+  function mapValues(m) {
+    if (!m) return [];
+    if (typeof m.forEach === 'function' && typeof m.get === 'function') {
+      var arr = []; m.forEach(function (v) { arr.push(v); }); return arr;
+    }
+    return Object.keys(m).map(function (k) { return m[k]; });
+  }
+
+  // Parse the source with Mermaid's own parser. For flowcharts we pull out
+  // vertices / edges / subgraphs — this powers collapse, search, and the
+  // incoming/outgoing lists in the details panel.
+  function buildModel(src) {
+    var mdl = emptyModel();
+    mdl.details = parseDetails(src);
+    var api = window.mermaid && window.mermaid.mermaidAPI;
+    if (!api || typeof api.getDiagramFromText !== 'function') return Promise.resolve(mdl);
+    return Promise.resolve()
+      .then(function () { return api.getDiagramFromText(src); })
+      .then(function (diag) {
+        var db = diag && diag.db;
+        if (!db || typeof db.getVertices !== 'function' || typeof db.getSubGraphs !== 'function') return mdl;
+        mdl.isFlowchart = true;
+        mapValues(db.getVertices()).forEach(function (v) {
+          mdl.vertices[v.id] = { id: v.id, label: stripHtml(v.text) || v.id };
+          mdl.vertexOrder.push(v.id);
+        });
+        (db.getEdges() || []).forEach(function (e) {
+          mdl.edges.push({
+            id: e.id, start: e.start, end: e.end, text: stripHtml(e.text),
+            type: e.type, stroke: e.stroke
+          });
+        });
+        var sgs = db.getSubGraphs() || [];
+        sgs.forEach(function (g) {
+          mdl.groups[g.id] = { id: g.id, title: stripHtml(g.title) || g.id, nodes: (g.nodes || []).slice() };
+          mdl.groupOrder.push(g.id);
+        });
+        // Direct parent = the smallest group listing the node.
+        var sizes = {};
+        mdl.groupOrder.forEach(function (gid) { sizes[gid] = descendants(mdl, gid).length; });
+        mdl.groupOrder.forEach(function (gid) {
+          mdl.groups[gid].nodes.forEach(function (n) {
+            if (n === gid) return;
+            var cur = mdl.parent[n];
+            if (!cur || sizes[gid] < sizes[cur]) mdl.parent[n] = gid;
+          });
+        });
+        return mdl;
+      })
+      .catch(function () { return mdl; });
+  }
+
+  function descendants(mdl, gid, seen) {
+    seen = seen || {};
+    if (seen[gid]) return [];
+    seen[gid] = true;
+    var g = mdl.groups[gid];
+    if (!g) return [];
+    var out = [];
+    g.nodes.forEach(function (n) {
+      if (n === gid || seen['n:' + n]) return;
+      seen['n:' + n] = true;
+      out.push(n);
+      if (mdl.groups[n]) out = out.concat(descendants(mdl, n, seen));
+    });
+    return out;
+  }
+
+  function ancestors(mdl, id) {
+    var out = [], p = mdl.parent[id], guard = 0;
+    while (p && guard++ < 100) { out.push(p); p = mdl.parent[p]; }
+    return out;
+  }
+
+  // ------------------------------------------------------------------
+  // Collapse: rewrite flowchart source so each collapsed subgraph becomes a
+  // single placeholder node, with edges re-routed to it.
+  // ------------------------------------------------------------------
+  var ID_CHAR = /[\p{L}\p{N}_]/u;
+
+  function skipGroup(line, i) {
+    var depth = 0, n = line.length;
+    while (i < n) {
+      var c = line[i];
+      if (c === '"') { var q = line.indexOf('"', i + 1); i = q < 0 ? n : q + 1; continue; }
+      if (c === '[' || c === '(' || c === '{') depth++;
+      else if (c === ']' || c === ')' || c === '}') { depth--; if (depth === 0) return i + 1; }
+      i++;
+    }
+    return n;
+  }
+  function skipShape(line, i) {
+    if (line.substr(i, 2) === '@{') i = skipGroup(line, i + 1);
+    else if ('[({'.indexOf(line[i]) >= 0) i = skipGroup(line, i);
+    else if (line[i] === '>') { var e = line.indexOf(']', i); i = e < 0 ? line.length : e + 1; }
+    if (line.substr(i, 3) === ':::') { i += 3; while (i < line.length && /[\w-]/.test(line[i])) i++; }
+    return i;
+  }
+  // Identifier tokens outside labels/shapes, with the span of their shape.
+  function scanTokens(line) {
+    var toks = [], i = 0, n = line.length;
+    while (i < n) {
+      var c = line[i];
+      if (c === '"') { var q = line.indexOf('"', i + 1); i = q < 0 ? n : q + 1; continue; }
+      if (c === '|') { var p = line.indexOf('|', i + 1); i = p < 0 ? n : p + 1; continue; }
+      if ('[({'.indexOf(c) >= 0) { i = skipGroup(line, i); continue; }
+      if (ID_CHAR.test(c) && (i === 0 || !ID_CHAR.test(line[i - 1]))) {
+        var j = i; while (j < n && ID_CHAR.test(line[j])) j++;
+        var end = skipShape(line, j);
+        toks.push({ id: line.slice(i, j), start: i, end: end, hasShape: end > j });
+        i = end; continue;
+      }
+      i++;
+    }
+    return toks;
+  }
+
+  function scanBlocks(lines) {
+    var blocks = [], stack = [];
+    lines.forEach(function (line, idx) {
+      var h = /^\s*subgraph\s+(.*?)\s*;?\s*$/.exec(line);
+      if (h) {
+        var rest = h[1], id = null, title = rest, m;
+        if ((m = /^([^\s\["]+)\s*\[(.*)\]$/.exec(rest))) { id = m[1]; title = m[2]; }
+        else if ((m = /^"(.*)"$/.exec(rest))) { title = m[1]; }
+        else { id = rest; }
+        stack.push({ start: idx, headerId: id, title: stripHtml(title.replace(/^"|"$/g, '')), order: blocks.length });
+        blocks.push(stack[stack.length - 1]);
+        return;
+      }
+      if (/^\s*end\s*;?\s*$/.test(line) && stack.length) stack.pop().end = idx;
+    });
+    return blocks.filter(function (b) { return b.end != null; });
+  }
+
+  function matchBlock(blocks, mdl, gid, used) {
+    var g = mdl.groups[gid], i;
+    for (i = 0; i < blocks.length; i++) if (!used[i] && blocks[i].headerId === gid) return i;
+    for (i = 0; i < blocks.length; i++) if (!used[i] && blocks[i].title === g.title) return i;
+    return -1;
+  }
+
+  function edgeArrow(e) {
+    var open = e.type === 'arrow_open';
+    if (e.stroke === 'thick') return open ? '===' : '==>';
+    if (e.stroke === 'dotted') return open ? '-.-' : '-.->';
+    return open ? '---' : '-->';
+  }
+  function quoteLabel(s) { return String(s).replace(/"/g, '#quot;').replace(/\|/g, '/'); }
+
+  function outermostCollapsed(mdl) {
+    return mdl.groupOrder.filter(function (gid) {
+      if (!collapsed[gid]) return false;
+      return !ancestors(mdl, gid).some(function (a) { return collapsed[a]; });
+    });
+  }
+
+  function collapseSource(src, mdl) {
+    var outer = outermostCollapsed(mdl);
+    var map = {};
+    outer.forEach(function (gid) {
+      descendants(mdl, gid).forEach(function (d) { map[d] = gid; });
+    });
+    var lines = src.split('\n');
+    var blocks = scanBlocks(lines);
+    var removed = {}, insertAt = {}, used = {};
+    outer.forEach(function (gid) {
+      var bi = matchBlock(blocks, mdl, gid, used);
+      if (bi < 0) return;
+      used[bi] = true;
+      var b = blocks[bi];
+      for (var i = b.start; i <= b.end; i++) removed[i] = true;
+      var g = mdl.groups[gid];
+      var count = descendants(mdl, gid).filter(function (d) { return !mdl.groups[d]; }).length;
+      var indent = (/^\s*/.exec(lines[b.start]) || [''])[0];
+      insertAt[b.start] = indent + gid + '[["&#9656; ' + quoteLabel(g.title) + ' &middot; ' + count + '"]]:::mmdCollapsed';
+    });
+
+    var out = [], inFront = false, anyCollapsed = outer.length > 0;
+    lines.forEach(function (line, idx) {
+      if (idx === 0 && line.trim() === '---') { inFront = true; out.push(line); return; }
+      if (inFront) { out.push(line); if (line.trim() === '---') inFront = false; return; }
+      if (insertAt[idx] != null) { out.push(insertAt[idx]); return; }
+      if (removed[idx]) return;
+      var t = line.trim();
+      if (!t || /^%%/.test(t) || /^(flowchart|graph|direction|classDef|subgraph|end\b|accTitle|accDescr|title)/.test(t)) {
+        out.push(line); return;
+      }
+      if (/^linkStyle\b/.test(t)) { if (!anyCollapsed) out.push(line); return; }
+      var toks = scanTokens(line);
+      var hit = toks.some(function (tk) { return HAS_OWN.call(map, tk.id); });
+      if (!hit) { out.push(line); return; }
+      if (/^(style|class|click)\b/.test(t)) return; // references hidden nodes
+      // Drop the statement; keep any visible nodes it mentioned (with their
+      // shape, if defined here) so they stay in the same subgraph. Edges are
+      // re-synthesised below from Mermaid's parsed edge list.
+      var indent = (/^\s*/.exec(line) || [''])[0];
+      toks.forEach(function (tk) {
+        if (HAS_OWN.call(map, tk.id)) return;
+        if (!mdl.vertices[tk.id] && !mdl.groups[tk.id]) return; // e.g. words in "-- edge text -->"
+        out.push(indent + line.slice(tk.start, tk.end));
+      });
+    });
+    out.push('classDef mmdCollapsed stroke-dasharray:6 3,stroke-width:2px,font-weight:bold');
+    var base = out.join('\n');
+
+    function mapId(id) { return HAS_OWN.call(map, id) ? map[id] : id; }
+    return buildModel(base).then(function (m2) {
+      var present = {};
+      m2.edges.forEach(function (e) { present[e.start + '\u0000' + e.end] = true; });
+      var extra = [];
+      mdl.edges.forEach(function (e) {
+        var s = mapId(e.start), t = mapId(e.end);
+        if (s === t) return;
+        var key = s + '\u0000' + t;
+        if (present[key]) return;
+        present[key] = true;
+        extra.push('  ' + s + ' ' + edgeArrow(e) + (e.text ? '|"' + quoteLabel(e.text) + '"|' : '') + ' ' + t);
+      });
+      return { source: extra.length ? base + '\n' + extra.join('\n') : base, map: map, outer: outer };
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Mermaid config + rendering
+  // ------------------------------------------------------------------
+  function configureMermaid() {
+    if (!window.mermaid) return;
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: 'default', // a %%{init}%% directive in the source overrides these
+      layout: state.layout,
+      look: 'classic'
+    });
+  }
+
+  function showMessage(text, isError) {
+    stage.innerHTML = '';
+    messageEl.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = isError ? 'mmd-error' : 'mmd-message';
+    d.textContent = isError ? 'Mermaid parse error:\n' + text : text;
+    messageEl.appendChild(d);
+    messageEl.classList.add('is-visible');
+    nodeEls = {}; clusterEls = {};
+  }
+
+  function cleanupRenderLeftovers(id) {
+    ['d' + id, id, 'i' + id].forEach(function (x) {
+      var el = document.getElementById(x);
+      if (el && !stage.contains(el)) el.remove();
+    });
+  }
+
+  // opts.focus: 'fit' (default) | 'keep' | { id, zoom }
+  // opts.focus: 'fit' (default) | 'keep' | { id, zoom }
+  // ------------------------------------------------------------------
+  // Source. Older builds stored several versions as "%% @section <id> | ..."
+  // blocks; versioning is gone, so a source holding such blocks shows only
+  // its latest one. Anything else is used as-is (CRLF normalised).
+  // ------------------------------------------------------------------
+  var SECTION = /^\s*%%\s*@section\s+\S.*$/;
+  function latestOnly(src) {
+    var lines = String(src == null ? '' : src).replace(/\r\n?/g, '\n').split('\n'), last = -1;
+    lines.forEach(function (l, i) { if (SECTION.test(l)) last = i; });
+    if (last < 0) return lines.join('\n');
+    return lines.slice(last + 1).join('\n').replace(/^(\s*\n)+/, '').replace(/\s+$/, '');
+  }
+  function setSource(src) { state.source = latestOnly(src); }
+
+  function renderPreview(opts) {
+    opts = opts || {};
+    var seq = ++renderSeq;
+    var full = state.source;
+    if (!full || !full.trim()) {
+      model = emptyModel(); updateGroupCtrls();
+      showMessage('No Mermaid source yet. Click Edit to add a diagram.');
+      return Promise.resolve();
+    }
+    if (!window.mermaid) { showMessage('Mermaid failed to load.'); return Promise.resolve(); }
+    configureMermaid();
+    var src = full;
+
+    return buildModel(src).then(function (mdl) {
+      if (!mdl || seq !== renderSeq) return null;
+      model = mdl;
+      // Collapse state is kept for groups missing from the source, so it
+      // survives edits; outermostCollapsed() ignores them.
+      if (state.startCollapsed && !collapseInitDone && mdl.groupOrder.length) {
+        mdl.groupOrder.forEach(function (g) { collapsed[g] = true; });
+      }
+      if (mdl.groupOrder.length || !mdl.isFlowchart) collapseInitDone = true;
+      updateGroupCtrls();
+      if (mdl.isFlowchart && outermostCollapsed(mdl).length) return collapseSource(src, mdl);
+      return { source: src, map: {}, outer: [] };
+    }).then(function (c) {
+      if (!c || seq !== renderSeq) return;
+      configureMermaid(); // buildModel may have applied diagram directives
+      var id = 'mmd-render-' + (renderCounter++);
+      return Promise.resolve()
+        .then(function () { return window.mermaid.render(id, c.source); })
+        .then(function (r) {
+          if (seq !== renderSeq) return;
+          messageEl.classList.remove('is-visible');
+          messageEl.innerHTML = '';
+          stage.innerHTML = r.svg;
+          if (r.bindFunctions) r.bindFunctions(stage);
+          hiddenMap = c.map;
+          placeholderIds = {};
+          c.outer.forEach(function (g) { placeholderIds[g] = true; });
+          afterRender(opts);
+        })
+        .catch(function (err) {
+          cleanupRenderLeftovers(id);
+          if (seq !== renderSeq) return;
+          showMessage((err && err.message) ? err.message : String(err), true);
+        });
+    });
+  }
+
+  function nodeIdOf(el) {
+    var id = el.getAttribute('data-id');
+    if (id) return id;
+    id = el.id || '';
+    var m = /^(?:mmd-render-\d+-)?(?:flowchart|classId|state|entity|node)-(.+?)-\d+$/.exec(id);
+    return m ? m[1] : id;
+  }
+
+  function afterRender(opts) {
+    var svg = stage.querySelector('svg');
+    if (!svg) return;
+    var vb = svg.viewBox && svg.viewBox.baseVal;
+    var w = vb && vb.width ? vb.width : svg.getBoundingClientRect().width;
+    var h = vb && vb.height ? vb.height : svg.getBoundingClientRect().height;
+    svg.setAttribute('width', w);
+    svg.setAttribute('height', h);
+    svg.style.maxWidth = 'none';
+    view.w = w; view.h = h;
+
+    nodeEls = {}; clusterEls = {};
+    var nodes = svg.querySelectorAll('[data-et="node"], g.node');
+    Array.prototype.forEach.call(nodes, function (el) {
+      if (el.closest('.mmd-node')) return; // nested duplicate
+      var id = nodeIdOf(el);
+      if (!id || nodeEls[id]) return;
+      el.classList.add('mmd-node');
+      el.setAttribute('data-mmd-id', id);
+      nodeEls[id] = el;
+      if (placeholderIds[id]) appendTitle(el, 'Click to expand group');
+    });
+    Array.prototype.forEach.call(svg.querySelectorAll('g.cluster'), function (el) {
+      var id = el.getAttribute('data-id') || (el.id || '').replace(/^mmd-render-\d+-/, '');
+      if (!id) return;
+      clusterEls[id] = el;
+      if (model.groups[id]) {
+        el.setAttribute('data-mmd-cluster', id);
+        var lbl = el.querySelector('.cluster-label') || el;
+        lbl.classList.add('mmd-cluster-toggle');
+        appendTitle(lbl, 'Click to collapse “' + model.groups[id].title + '”');
+      }
+    });
+
+    if (selectedId && nodeEls[selectedId]) {
+      nodeEls[selectedId].classList.add('mmd-selected');
+      selectNode(selectedId); // refresh panel
+    } else if (selectedId && !isHidden(selectedId) && !model.vertices[selectedId]) closeDetails();
+    refreshSearch(false);
+
+    var f = opts.focus || 'fit';
+    if (f === 'fit') fit();
+    else if (f === 'keep') applyTransform();
+    else if (f && f.id) centerOn(f.id, f.zoom);
+  }
+
+  function appendTitle(el, text) {
+    var t = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    t.textContent = text;
+    el.insertBefore(t, el.firstChild);
+  }
+
+  function isHidden(id) { return HAS_OWN.call(hiddenMap, id); }
+
+  // ------------------------------------------------------------------
+  // Pan / zoom
+  // ------------------------------------------------------------------
+  function toolbarPad() {
+    return toolbar.classList.contains('is-visible') ? toolbar.offsetHeight + 16 : 16;
+  }
+  function applyTransform(animate) {
+    stage.classList.toggle('is-animating', !!animate);
+    stage.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.k + ')';
+    zoomPct.textContent = Math.round(view.k * 100) + '%';
+    if (animate) setTimeout(function () { stage.classList.remove('is-animating'); }, 240);
+  }
+  function fit(animate) {
+    var pw = viewport.clientWidth, ph = viewport.clientHeight;
+    if (!pw || !ph || !view.w || !view.h) { view.needsFit = true; return; }
+    var top = toolbarPad(), pad = 16, bottom = 48;
+    var left = pad;
+    var k = Math.min((pw - left - pad) / view.w, (ph - top - bottom) / view.h, FIT_MAX);
+    if (!isFinite(k) || k <= 0) k = 1;
+    view.k = Math.max(ZOOM_MIN, k);
+    view.tx = left + (pw - left - pad - view.w * view.k) / 2;
+    view.ty = top + Math.max(0, (ph - top - bottom - view.h * view.k) / 2);
+    view.userMoved = false;
+    view.needsFit = false;
+    applyTransform(animate);
+  }
+  function resetView() {
+    var pw = viewport.clientWidth, ph = viewport.clientHeight;
+    view.k = 1;
+    view.tx = (pw - view.w) / 2;
+    view.ty = view.h + toolbarPad() < ph ? (ph - view.h) / 2 : toolbarPad();
+    view.userMoved = true;
+    applyTransform(true);
+  }
+  function zoomAt(factor, cx, cy, animate) {
+    var k2 = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, view.k * factor));
+    var r = k2 / view.k;
+    view.tx = cx - (cx - view.tx) * r;
+    view.ty = cy - (cy - view.ty) * r;
+    view.k = k2;
+    view.userMoved = true;
+    applyTransform(animate);
+  }
+  function zoomCenter(factor) { zoomAt(factor, viewport.clientWidth / 2, viewport.clientHeight / 2, true); }
+
+  function centerOn(id, zoom) {
+    var el = nodeEls[id] || clusterEls[id];
+    if (!el) { applyTransform(); return; }
+    var pr = viewport.getBoundingClientRect(), er = el.getBoundingClientRect();
+    var cx = (er.left + er.width / 2 - pr.left - view.tx) / view.k;
+    var cy = (er.top + er.height / 2 - pr.top - view.ty) / view.k;
+    if (zoom) view.k = Math.min(ZOOM_MAX, Math.max(view.k, 1));
+    view.tx = pr.width / 2 - cx * view.k;
+    view.ty = pr.height / 2 - cy * view.k;
+    view.userMoved = true;
+    applyTransform(true);
+  }
+
+  $('mmd-zoom-in').addEventListener('click', function () { zoomCenter(ZOOM_STEP); });
+  $('mmd-zoom-out').addEventListener('click', function () { zoomCenter(1 / ZOOM_STEP); });
+  $('mmd-zoom-pct').addEventListener('click', resetView);
+  $('mmd-zoom-fit').addEventListener('click', function () { fit(true); });
+
+  // Mouse wheel + trackpad pinch (pinch arrives as ctrlKey wheel events).
+  viewport.addEventListener('wheel', function (e) {
+    if (!view.w) return;
+    e.preventDefault();
+    var dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+    var factor = Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0018));
+    var r = viewport.getBoundingClientRect();
+    zoomAt(factor, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+
+  // Drag to pan (mouse/pen/touch), two-finger touch pinch to zoom.
+  var pointers = {}, pointerCount = 0;
+  var drag = null, pinch = null, suppressClick = false;
+  function ptList() { return Object.keys(pointers).map(function (k) { return pointers[k]; }); }
+  function startPinch() {
+    var p = ptList(), r = viewport.getBoundingClientRect();
+    var mid = { x: (p[0].x + p[1].x) / 2 - r.left, y: (p[0].y + p[1].y) / 2 - r.top };
+    pinch = {
+      dist: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1, k: view.k,
+      px: (mid.x - view.tx) / view.k, py: (mid.y - view.ty) / view.k
+    };
+  }
+  viewport.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (messageEl.contains(e.target)) return;
+    suppressClick = false;
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    pointerCount = Object.keys(pointers).length;
+    if (pointerCount === 1) drag = { x: e.clientX, y: e.clientY, tx: view.tx, ty: view.ty, moved: false };
+    else if (pointerCount === 2) { startPinch(); if (drag) drag.moved = true; }
+  });
+  viewport.addEventListener('pointermove', function (e) {
+    if (!pointers[e.pointerId]) return;
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    if (pointerCount >= 2 && pinch) {
+      var p = ptList(), r = viewport.getBoundingClientRect();
+      var dist = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1;
+      var mx = (p[0].x + p[1].x) / 2 - r.left, my = (p[0].y + p[1].y) / 2 - r.top;
+      view.k = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, pinch.k * dist / pinch.dist));
+      view.tx = mx - pinch.px * view.k;
+      view.ty = my - pinch.py * view.k;
+      view.userMoved = true;
+      applyTransform();
+      return;
+    }
+    if (!drag) return;
+    var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) > 4) {
+      drag.moved = true;
+      // Capture only once it's a real drag, so plain clicks still reach nodes.
+      try { viewport.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      viewport.classList.add('is-panning');
+    }
+    if (drag.moved) {
+      view.tx = drag.tx + dx; view.ty = drag.ty + dy;
+      view.userMoved = true;
+      applyTransform();
+    }
+  });
+  function endPointer(e) {
+    if (!pointers[e.pointerId]) return;
+    delete pointers[e.pointerId];
+    pointerCount = Object.keys(pointers).length;
+    if (drag && drag.moved) suppressClick = true;
+    if (pointerCount === 1) {
+      var p = ptList()[0];
+      pinch = null;
+      drag = { x: p.x, y: p.y, tx: view.tx, ty: view.ty, moved: true };
+    } else if (pointerCount === 0) {
+      drag = null; pinch = null;
+      viewport.classList.remove('is-panning');
+    }
+  }
+  viewport.addEventListener('pointerup', endPointer);
+  viewport.addEventListener('pointercancel', endPointer);
+
+  // ------------------------------------------------------------------
+  // Clicks: node -> details, placeholder -> expand, cluster label -> collapse
+  // ------------------------------------------------------------------
+  viewport.addEventListener('click', function (e) {
+    if (suppressClick) { suppressClick = false; e.stopPropagation(); e.preventDefault(); return; }
+    var t = e.target;
+    if (!(t instanceof Element)) return;
+    var nodeEl = t.closest('.mmd-node');
+    if (nodeEl && stage.contains(nodeEl)) {
+      var id = nodeEl.getAttribute('data-mmd-id');
+      if (placeholderIds[id]) { expandGroup(id); return; }
+      selectNode(id);
+      return;
+    }
+    var lbl = t.closest('.mmd-cluster-toggle');
+    if (lbl) {
+      var cl = lbl.closest('[data-mmd-cluster]');
+      if (cl) { collapseGroup(cl.getAttribute('data-mmd-cluster')); return; }
+    }
+    if (stage.contains(t) || t === viewport) closeDetails();
   });
 
-  // ResizeObserver: defensive re-application of responsive SVG sizing.
-  // Mermaid sets its own width/height attrs on every render, so this keeps
-  // the diagram filling the panel as it's resized rather than relying on a
-  // one-time style application. Full geometry recompute (as the gauge
-  // plugin does) isn't needed here — Mermaid's SVG carries its own viewBox,
-  // so vector text scales cleanly without going illegible.
-  new ResizeObserver(function () {
-    applyResponsiveSvgStyle(previewPane.querySelector('svg'));
-  }).observe(document.getElementById('mmd-root'));
+  function expandGroup(gid, focus) {
+    delete collapsed[gid];
+    renderPreview({ focus: focus || { id: gid } });
+  }
+  function collapseGroup(gid) {
+    collapsed[gid] = true;
+    if (selectedId && descendants(model, gid).indexOf(selectedId) >= 0) closeDetails();
+    renderPreview({ focus: { id: gid } });
+  }
+  $('mmd-collapse-all').addEventListener('click', function () {
+    model.groupOrder.forEach(function (g) { collapsed[g] = true; });
+    closeDetails();
+    renderPreview();
+  });
+  $('mmd-expand-all').addEventListener('click', function () {
+    collapsed = {};
+    renderPreview();
+  });
+  function updateGroupCtrls() {
+    groupCtrls.classList.toggle('is-visible', model.isFlowchart && model.groupOrder.length > 0);
+  }
 
-  // Immediate standalone paint: covers both "no client at all" (opened as a
-  // bare file, React/SDK missing) AND "client object exists but there's no
-  // real Sigma host to ever invoke config.subscribe" (SDK loaded standalone
-  // in a plain browser tab) — the latter would otherwise hang blank forever
-  // waiting for a callback that never arrives. Real config overwrites this
-  // once (and if) it does arrive.
-  setActiveView('Preview');
+  // Reveal a (possibly hidden) node, then run focus.
+  function revealAndFocus(id, zoom) {
+    if (isHidden(id) || ancestors(model, id).some(function (a) { return collapsed[a]; })) {
+      ancestors(model, id).forEach(function (a) { delete collapsed[a]; });
+      return renderPreview({ focus: { id: id, zoom: zoom } });
+    }
+    centerOn(id, zoom);
+    return Promise.resolve();
+  }
+
+  // ------------------------------------------------------------------
+  // Node details panel
+  // ------------------------------------------------------------------
+  function detailsFor(id) {
+    var d = model.details;
+    if (d[id]) return d[id];
+    var el = nodeEls[id];
+    if (el && el.id) {
+      var m = /-(.+?)-\d+$/.exec(el.id);
+      if (m && d[m[1]]) return d[m[1]];
+    }
+    var label = labelOf(id);
+    return d[label] || [];
+  }
+  function labelOf(id) {
+    if (model.vertices[id]) return model.vertices[id].label;
+    if (model.groups[id]) return model.groups[id].title;
+    var el = nodeEls[id];
+    return el ? (el.textContent || '').replace(/\s+/g, ' ').trim() || id : id;
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function nodeLink(id) {
+    var b = el('button', 'mmd-linkbtn', labelOf(id));
+    b.type = 'button';
+    b.title = id;
+    b.addEventListener('click', function () {
+      revealAndFocus(id, true).then(function () { selectNode(id); });
+    });
+    return b;
+  }
+
+  function selectNode(id) {
+    if (selectedId && nodeEls[selectedId]) nodeEls[selectedId].classList.remove('mmd-selected');
+    selectedId = id;
+    if (nodeEls[id]) nodeEls[id].classList.add('mmd-selected');
+
+    dTitle.textContent = labelOf(id);
+    dId.textContent = id;
+    dBody.innerHTML = '';
+
+    var rows = detailsFor(id), extra = [];
+    rows.forEach(function (r) {
+      var k = r.key.toLowerCase();
+      if (k === 'description' || k === 'desc') dBody.appendChild(el('div', 'mmd-d-desc', r.value));
+      else if (k === 'status') dBody.appendChild(el('span', 'mmd-d-status', r.value));
+      else extra.push(r);
+    });
+    extra.forEach(function (r) {
+      var row = el('div', 'mmd-d-row');
+      row.appendChild(el('div', 'mmd-d-key', r.key));
+      var v = el('div', 'mmd-d-val');
+      var k = r.key.toLowerCase();
+      var url = (k === 'url' || k === 'link') ? safeUrl(r.value) : null;
+      if (url) {
+        var a = el('a', null, r.value); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        v.appendChild(a);
+      } else if (k === 'rule' || k === 'formula') {
+        v.appendChild(el('code', null, r.value));
+      } else {
+        v.textContent = r.value;
+      }
+      row.appendChild(v);
+      dBody.appendChild(row);
+    });
+
+    var parent = model.parent[id];
+    if (parent && model.groups[parent]) {
+      var gr = el('div', 'mmd-d-row');
+      gr.appendChild(el('div', 'mmd-d-key', 'Group'));
+      var gv = el('div', 'mmd-d-val'); gv.textContent = model.groups[parent].title;
+      gr.appendChild(gv);
+      dBody.appendChild(gr);
+    }
+
+    if (model.isFlowchart) {
+      var inc = [], out = [];
+      model.edges.forEach(function (e) {
+        if (e.end === id && e.start !== id) inc.push(e);
+        if (e.start === id && e.end !== id) out.push(e);
+      });
+      [['Incoming', inc, 'start'], ['Outgoing', out, 'end']].forEach(function (sec) {
+        if (!sec[1].length) return;
+        dBody.appendChild(el('div', 'mmd-d-section', sec[0] + ' (' + sec[1].length + ')'));
+        var ul = el('ul', 'mmd-d-links');
+        sec[1].forEach(function (e) {
+          var li = el('li');
+          li.appendChild(nodeLink(e[sec[2]]));
+          if (e.text) li.appendChild(document.createTextNode(' — ' + e.text));
+          ul.appendChild(li);
+        });
+        dBody.appendChild(ul);
+      });
+    }
+    if (!rows.length) {
+      dBody.appendChild(el('div', 'mmd-d-hint',
+        'Add details in the source:\n%% @details ' + id + ' | Description: … | Owner: … | Status: … | URL: https://…'));
+    }
+    detailsEl.classList.add('is-visible');
+  }
+  function closeDetails() {
+    if (selectedId && nodeEls[selectedId]) nodeEls[selectedId].classList.remove('mmd-selected');
+    selectedId = null;
+    detailsEl.classList.remove('is-visible');
+  }
+  $('mmd-d-close').addEventListener('click', closeDetails);
+
+  // ------------------------------------------------------------------
+  // Search
+  // ------------------------------------------------------------------
+  function searchIndex() {
+    var items = [];
+    function detailText(id) {
+      return (model.details[id] || []).map(function (r) { return r.value; }).join(' ');
+    }
+    if (model.isFlowchart) {
+      model.vertexOrder.forEach(function (id) {
+        items.push({ id: id, text: (id + ' ' + model.vertices[id].label + ' ' + detailText(id)).toLowerCase() });
+      });
+      model.groupOrder.forEach(function (id) {
+        items.push({ id: id, text: (id + ' ' + model.groups[id].title).toLowerCase(), group: true });
+      });
+    } else {
+      Object.keys(nodeEls).forEach(function (id) {
+        items.push({ id: id, text: (id + ' ' + labelOf(id) + ' ' + detailText(id)).toLowerCase() });
+      });
+    }
+    return items;
+  }
+
+  function refreshSearch(jump) {
+    var svg = stage.querySelector('svg');
+    Array.prototype.forEach.call(stage.querySelectorAll('.mmd-hit, .mmd-hit-current'), function (n) {
+      n.classList.remove('mmd-hit', 'mmd-hit-current');
+    });
+    var q = search.query.trim().toLowerCase();
+    if (!q) {
+      search.matches = []; search.idx = -1;
+      if (svg) svg.classList.remove('mmd-searching');
+      searchNav.classList.remove('is-visible');
+      searchCount.textContent = '';
+      return;
+    }
+    var prevId = search.matches[search.idx];
+    search.matches = searchIndex().filter(function (it) { return it.text.indexOf(q) >= 0; })
+      .map(function (it) { return it.id; });
+    var keep = prevId ? search.matches.indexOf(prevId) : -1;
+    search.idx = search.matches.length ? (keep >= 0 ? keep : 0) : -1;
+    if (svg) svg.classList.add('mmd-searching');
+    search.matches.forEach(function (id, i) {
+      var target = nodeEls[id] || nodeEls[hiddenMap[id]];
+      if (target) {
+        target.classList.add('mmd-hit');
+        if (i === search.idx) target.classList.add('mmd-hit-current');
+      }
+    });
+    searchNav.classList.toggle('is-visible', search.matches.length > 1);
+    searchCount.textContent = search.matches.length ? (search.idx + 1) + '/' + search.matches.length : 'No match';
+    if (jump && search.idx >= 0) goToMatch(search.idx);
+  }
+
+  function goToMatch(i) {
+    if (!search.matches.length) return;
+    search.idx = (i + search.matches.length) % search.matches.length;
+    var id = search.matches[search.idx];
+    var isGroup = model.groups[id] && !model.vertices[id];
+    var p = isGroup && !collapsed[id] && clusterEls[id] ? (centerOn(id, false), Promise.resolve()) : revealAndFocus(id, true);
+    p.then(function () { refreshSearch(false); });
+  }
+
+  var searchTimer = null;
+  searchInput.addEventListener('input', function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () {
+      search.query = searchInput.value;
+      search.matches = []; search.idx = -1;
+      refreshSearch(true);
+    }, 150);
+  });
+  searchInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); goToMatch(search.idx + (e.shiftKey ? -1 : 1)); }
+    else if (e.key === 'Escape') { searchInput.value = ''; search.query = ''; refreshSearch(false); viewport.focus(); }
+  });
+  $('mmd-search-next').addEventListener('click', function () { goToMatch(search.idx + 1); });
+  $('mmd-search-prev').addEventListener('click', function () { goToMatch(search.idx - 1); });
+
+  // Keyboard shortcuts on the canvas.
+  document.addEventListener('keydown', function (e) {
+    if (state.view !== 'Preview') return;
+    var tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.metaKey || e.ctrlKey || e.altKey) return;
+    var step = 60;
+    switch (e.key) {
+      case '+': case '=': zoomCenter(ZOOM_STEP); break;
+      case '-': case '_': zoomCenter(1 / ZOOM_STEP); break;
+      case '0': resetView(); break;
+      case 'f': case 'F': fit(true); break;
+      case 'ArrowLeft': view.tx += step; view.userMoved = true; applyTransform(true); break;
+      case 'ArrowRight': view.tx -= step; view.userMoved = true; applyTransform(true); break;
+      case 'ArrowUp': view.ty += step; view.userMoved = true; applyTransform(true); break;
+      case 'ArrowDown': view.ty -= step; view.userMoved = true; applyTransform(true); break;
+      case '/': if (state.showToolbar) { searchInput.focus(); searchInput.select(); } break;
+      case 'Escape': closeDetails(); break;
+      default: return;
+    }
+    e.preventDefault();
+  });
+
+  var warnEl = $('mmd-warn');
+
+  // ------------------------------------------------------------------
+  // Saving. state.source is updated immediately on every edit; writing it
+  // to Sigma is debounced. Echoes of our own writes are recognised and
+  // ignored, and if Sigma never echoes a write back (e.g. the workbook is
+  // open in view mode, where plugin settings can't be saved) we say so.
+  // ------------------------------------------------------------------
+  var ownWrites = [], lastConfigText = null;
+  var saveTimer = null, pendingSave = null, pendingTimer = null;
+  var saveStatus = '';
+
+  function setSaveStatus(s) {
+    saveStatus = s;
+    var el = $('mmd-eh-save');
+    var txt = s === 'saved' ? 'Saved' : s === 'saving' ? 'Saving…' : s === 'local' ? 'Not connected to Sigma — changes stay in this preview' : '';
+    el.textContent = txt;
+    el.classList.remove('is-error');
+    warnEl.classList.toggle('is-visible', s === 'unsaved');
+    if (s === 'unsaved') {
+      el.textContent = '⚠ Not saved to the workbook';
+      el.classList.add('is-error');
+      warnEl.textContent = '⚠ Changes aren’t being saved to the workbook. Open it in edit mode (or paste into the Mermaid Source property) to keep them. Click to dismiss.';
+    }
+  }
+  // Comparison key: Sigma may rewrite the stored text (CRLF, trailing
+  // whitespace), so "same text" means same after this normalisation.
+  function canon(s) {
+    return String(s == null ? '' : s).replace(/\r\n?/g, '\n').split('\n')
+      .map(function (l) { return l.replace(/\s+$/, ''); }).join('\n').trim();
+  }
+  function persistNow() {
+    var src = state.source;
+    ownWrites.push(src);
+    if (ownWrites.length > 30) ownWrites.shift();
+    persist('mermaidText', src);
+    if (!client) { setSaveStatus('local'); return; }
+    pendingSave = src;
+    setSaveStatus('saving');
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(function () { if (pendingSave === src) setSaveStatus('unsaved'); }, 5000);
+  }
+  function noteEcho(text) {
+    if (pendingSave !== null && canon(text) === canon(pendingSave)) {
+      pendingSave = null; clearTimeout(pendingTimer); setSaveStatus('saved');
+    }
+  }
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () { saveTimer = null; persistNow(); renderPreview({ focus: 'keep' }); }, 350);
+  }
+  function flushSave() {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer); saveTimer = null;
+    persistNow();
+    renderPreview({ focus: 'keep' });
+  }
+  warnEl.addEventListener('click', function () { warnEl.classList.remove('is-visible'); });
+  window.addEventListener('pagehide', flushSave);
+  document.addEventListener('visibilitychange', function () { if (document.hidden) flushSave(); });
+
+  // ------------------------------------------------------------------
+  // Edit view: a textarea over the Mermaid source.
+  // ------------------------------------------------------------------
+  var ehSyntax = $('mmd-eh-syntax');
+  var syntaxSeq = 0;
+
+  function refreshEditor() {
+    editTextarea.value = state.source || '';
+    checkSyntax();
+  }
+
+  function checkSyntax() {
+    var seq = ++syntaxSeq, text = editTextarea.value;
+    if (!window.mermaid || !text.trim()) { ehSyntax.textContent = ''; ehSyntax.classList.remove('is-error'); return; }
+    Promise.resolve().then(function () { return window.mermaid.parse(text); })
+      .then(function () {
+        if (seq !== syntaxSeq) return;
+        ehSyntax.textContent = '✓ Diagram looks valid'; ehSyntax.classList.remove('is-error');
+      })
+      .catch(function (err) {
+        if (seq !== syntaxSeq) return;
+        ehSyntax.textContent = '⚠ ' + String((err && err.message) || err).split('\n')[0];
+        ehSyntax.classList.add('is-error');
+      });
+  }
+
+  editTextarea.addEventListener('input', function () {
+    state.source = editTextarea.value;
+    scheduleSave();
+    checkSyntax();
+  });
+  editTextarea.addEventListener('blur', flushSave);
+  editTextarea.addEventListener('keydown', function (e) {
+    if (e.key === 'Tab' && !e.shiftKey) { // indent instead of leaving the field
+      e.preventDefault();
+      var s = editTextarea.selectionStart, en = editTextarea.selectionEnd;
+      editTextarea.value = editTextarea.value.slice(0, s) + '  ' + editTextarea.value.slice(en);
+      editTextarea.selectionStart = editTextarea.selectionEnd = s + 2;
+      editTextarea.dispatchEvent(new Event('input'));
+    }
+  });
+  // ------------------------------------------------------------------
+  // Chrome (layout is set only from the Properties panel)
+  // ------------------------------------------------------------------
+  function applyChrome() {
+    var preview = state.view === 'Preview';
+    toolbar.classList.toggle('is-visible', preview && state.showToolbar);
+    zoomControls.classList.toggle('is-visible', preview);
+    if (!preview) detailsEl.classList.remove('is-visible');
+    else if (selectedId) detailsEl.classList.add('is-visible');
+  }
+
+  // The Properties "Default View" picks the pane: Preview or Edit.
+  function setActiveView(v) {
+    state.configView = (v === 'Edit') ? 'Edit' : 'Preview';
+    var eff = state.configView;
+    var changed = eff !== state.view;
+    state.view = eff;
+    editPane.classList.toggle('is-visible', eff === 'Edit');
+    viewport.classList.toggle('is-visible', eff === 'Preview');
+    if (eff === 'Edit' && changed) refreshEditor(true);
+    if (eff !== 'Edit' && changed) flushSave();
+    applyChrome();
+    if (eff === 'Preview' && changed) renderPreview();
+  }
+
+  new ResizeObserver(function () {
+    if (state.view !== 'Preview' || !view.w) return;
+    if (view.needsFit || !view.userMoved) fit();
+    else applyTransform();
+  }).observe(root);
+
+  // ------------------------------------------------------------------
+  // Reset everything (Properties "Reset everything" toggle): back to the
+  // stock diagram and default settings. The toggle switches
+  // itself back off.
+  // ------------------------------------------------------------------
+  var resetting = false;
+  function doResetAll() {
+    clearTimeout(saveTimer); saveTimer = null;
+    warnEl.classList.remove('is-visible');
+    closeDetails();
+    search = { query: '', matches: [], idx: -1 }; searchInput.value = '';
+    collapsed = {}; collapseInitDone = false;
+    state.layout = 'elk';
+    state.startCollapsed = false; state.showToolbar = true;
+    ownWrites = [];
+    setSource(DEFAULT_DIAGRAM);
+    persistNow();
+    persist('layout', 'ELK Layered');
+    persist('startCollapsed', false); persist('showToolbar', true);
+    persist('defaultView', 'Preview');
+    persist('resetAll', false);
+    view.userMoved = false; view.needsFit = true;
+    setActiveView('Preview');
+    applyChrome();
+    renderPreview({ focus: 'fit' });
+  }
+
+  // ------------------------------------------------------------------
+  // Boot: immediate standalone paint, then (maybe) real Sigma config.
+  // ------------------------------------------------------------------
   setSource(DEFAULT_DIAGRAM);
+  editPane.classList.remove('is-visible');
+  viewport.classList.add('is-visible');
+  applyChrome();
+  renderPreview();
 
   if (!client) return;
 
   client.config.configureEditorPanel([
-    {
-      name: 'mermaidText', type: 'text', label: 'Mermaid Source',
-      multiline: true, defaultValue: DEFAULT_DIAGRAM
-    },
-    {
-      name: 'defaultView', type: 'radio', label: 'Default View',
-      values: ['Preview', 'Edit'], defaultValue: 'Preview', singleLine: true
-    }
+    { name: 'mermaidText', type: 'text', label: 'Mermaid Source', multiline: true, defaultValue: DEFAULT_DIAGRAM },
+    { name: 'defaultView', type: 'radio', label: 'Default View', values: ['Preview', 'Edit'], defaultValue: 'Preview', singleLine: true },
+    { name: 'layout', type: 'dropdown', label: 'Layout', values: labelsOf(LAYOUTS), defaultValue: 'ELK Layered' },
+    { name: 'startCollapsed', type: 'toggle', label: 'Start with groups collapsed', defaultValue: false },
+    { name: 'showToolbar', type: 'toggle', label: 'Show toolbar (search, collapse/expand)', defaultValue: true },
+    { name: 'resetAll', type: 'toggle', label: 'Reset everything (turn on to clear all and start over)', defaultValue: false }
   ]);
 
   client.config.subscribe(function (config) {
-    setActiveView((config && config.defaultView) || 'Preview');
-
-    var text = (config && typeof config.mermaidText === 'string') ? config.mermaidText : null;
-    // Skip re-applying if it matches what we already have — this is either
-    // our own write echoing back (avoids clobbering textarea cursor/focus)
-    // or simply unchanged.
-    if (text !== null && text !== currentSource) {
-      setSource(text);
+    config = config || {};
+    if (config.resetAll === true) {
+      if (!resetting) { resetting = true; doResetAll(); }
+      return; // ignore the stale values still in this push; the toggle flips itself back off
     }
+    resetting = false;
+    var needRender = false, needFit = false;
+
+    var layout = toValue(LAYOUTS, config.layout, 'elk');
+    if (layout !== state.layout) { state.layout = layout; needRender = true; needFit = true; }
+
+    var sc = config.startCollapsed === true;
+    if (sc !== state.startCollapsed) {
+      state.startCollapsed = sc;
+      collapseInitDone = false;
+      if (!sc) collapsed = {};
+      needRender = true; needFit = true;
+    }
+    var tb = config.showToolbar !== false;
+    if (tb !== state.showToolbar) { state.showToolbar = tb; if (!tb) { search.query = ''; searchInput.value = ''; } needRender = true; }
+
+    // Source text. Only react when it CHANGED since the last push — other
+    // property changes re-deliver the saved text, which must never clobber an
+    // edit that hasn't been saved — and ignore echoes of our own writes.
+    var text = typeof config.mermaidText === 'string' ? config.mermaidText : null;
+    var textChanged = text !== null && (lastConfigText === null || canon(text) !== canon(lastConfigText));
+    if (text !== null) { lastConfigText = text; noteEcho(text); }
+    if (textChanged && canon(text) !== canon(state.source) &&
+        !ownWrites.some(function (w) { return canon(w) === canon(text); }) && !saveTimer) {
+      setSource(text); // changed outside this editor (e.g. the Properties field)
+      if (state.view === 'Edit') refreshEditor();
+      needRender = true; needFit = true;
+    }
+
+    var prevView = state.view;
+    setActiveView(config.defaultView === undefined ? state.configView : config.defaultView);
+    applyChrome();
+    var switchedToPreview = prevView !== state.view && state.view === 'Preview';
+    if (needRender && !switchedToPreview) renderPreview({ focus: needFit || !view.userMoved ? 'fit' : 'keep' });
   });
 })();
 </script>
